@@ -1,0 +1,14 @@
+# 运行必需
+numpy>=1.26
+sounddevice>=0.4.4      # 设备实测；不装也能跑仿真/文件模式
+soxr>=0.5.0             # far/near 重采样（48k→16k 等）
+soundfile>=0.12         # 读写 wav/flac/ogg/mp3
+
+# WebUI
+fastapi>=0.110
+uvicorn>=0.27
+python-multipart>=0.0.9  # 文件上传
+
+# 分析与绘图
+matplotlib>=3.7
+scipy>=1.10             # soxr/soundfile 缺失时的兜底重采样

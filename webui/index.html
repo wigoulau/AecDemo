@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AEC 测试台 · WebRTC APM</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">AEC</span>
+    <div>
+      <h1>回声消除测试台</h1>
+      <p class="sub">WebRTC APM · 离线仿真 / 输入音频 / 设备实测</p>
+    </div>
+  </div>
+  <div class="statusline">
+    <span id="apm-badge" class="badge badge-warn">APM 检测中…</span>
+    <span id="platform" class="mono small"></span>
+    <button id="btn-refresh" class="ghost" title="刷新状态">刷新</button>
+  </div>
+</header>
+
+<main class="layout">
+  <aside class="col-left">
+    <section class="card">
+      <h2>测试模式</h2>
+      <div class="tabs" id="mode-tabs">
+        <button class="tab active" data-mode="simulate">离线仿真</button>
+        <button class="tab" data-mode="files">音频文件</button>
+        <button class="tab" data-mode="device">设备实测</button>
+        <button class="tab" data-mode="compare">参数对比</button>
+      </div>
+
+      <!-- 仿真 -->
+      <div class="pane" data-pane="simulate">
+        <p class="hint">程序合成 mic/ref 两路信号（已知回声与近端真值），无需任何硬件即可验证 AEC 是否工作。</p>
+        <div class="grid2">
+          <label>时长 (s)<input type="number" id="sim-duration" value="6" min="2" max="60" step="1"></label>
+          <label>采样率
+            <select id="sim-rate">
+              <option value="16000" selected>16000</option>
+              <option value="48000">48000</option>
+              <option value="8000">8000</option>
+              <option value="32000">32000</option>
+            </select>
+          </label>
+          <label>参考信号 (far)
+            <select id="sim-ref-source">
+              <option value="speech" selected>类语音（推荐）</option>
+              <option value="chirp">短扫频突发</option>
+              <option value="sweep">连续扫频（AEC 难收敛）</option>
+              <option value="file">上传音频</option>
+              <option value="silence">静音</option>
+            </select>
+          </label>
+          <label>近端人声 (mic)
+            <select id="sim-mic-source">
+              <option value="speech" selected>类语音</option>
+              <option value="tone">440Hz 单音</option>
+              <option value="noise">噪声</option>
+              <option value="file">上传音频</option>
+              <option value="silence">无人声（仅回声）</option>
+            </select>
+          </label>
+        </div>
+        <div class="filepick" id="sim-ref-file-wrap">
+          <div class="filepick-row">
+            <select class="upload-select" id="sim-ref-file"><option value="">— 选择已上传音频 —</option></select>
+            <label class="mini-btn">上传<input type="file" accept="audio/*" class="upload-input" data-target="sim-ref-file"></label>
+          </div>
+        </div>
+        <div class="filepick" id="sim-mic-file-wrap">
+          <div class="filepick-row">
+            <select class="upload-select" id="sim-mic-file"><option value="">— 选择已上传音频 —</option></select>
+            <label class="mini-btn">上传<input type="file" accept="audio/*" class="upload-input" data-target="sim-mic-file"></label>
+          </div>
+        </div>
+        <details class="adv">
+          <summary>回声路径与电平</summary>
+          <div class="grid2">
+            <label>回声延迟 (ms)<input type="number" id="sim-echo-delay" value="50" min="0" max="400"></label>
+            <label>回声增益<input type="number" id="sim-echo-gain" value="0.6" min="0" max="2" step="0.05"></label>
+            <label>二次反射增益<input type="number" id="sim-echo-gain2" value="0.15" min="0" max="1" step="0.05"></label>
+            <label>混响 RT60 (s)<input type="number" id="sim-rt60" value="0.15" min="0" max="1.5" step="0.05"></label>
+            <label>扬声器非线性<input type="number" id="sim-nonlin" value="0.15" min="0" max="1" step="0.05"></label>
+            <label>近端人声电平<input type="number" id="sim-speech" value="0.35" min="0" max="2" step="0.05"></label>
+            <label>底噪电平<input type="number" id="sim-noise" value="0.004" min="0" max="0.2" step="0.001"></label>
+            <label>前置静音 (ms)<input type="number" id="sim-baseline" value="300" min="0" max="2000" step="50"></label>
+          </div>
+        </details>
+      </div>
+
+      <!-- 文件 -->
+      <div class="pane hidden" data-pane="files">
+        <p class="hint">上传或选择两路<strong>同一时间轴</strong>的 WAV：mic = 麦克风录制（含回声），ref = 当时扬声器播放的信号。</p>
+        <div class="filepick-row">
+          <label>mic 文件
+            <select class="upload-select" id="file-mic"><option value="">— 选择上传文件 —</option></select>
+          </label>
+          <label class="mini-btn">上传<input type="file" accept="audio/*" class="upload-input" data-target="file-mic"></label>
+        </div>
+        <div class="filepick-row">
+          <label>ref 文件
+            <select class="upload-select" id="file-ref"><option value="">— 选择上传文件 —</option></select>
+          </label>
+          <label class="mini-btn">上传<input type="file" accept="audio/*" class="upload-input" data-target="file-ref"></label>
+        </div>
+        <p class="hint warn-text">没有现成素材？先用「离线仿真」跑一次，output 目录里的 <code>aec_in.wav</code> 是 L=mic/R=ref 的合轨文件，可拆出来当输入。</p>
+        <div class="row">
+          <button id="btn-download-aec-in" class="ghost small-btn">下载最近一次 aec_in.wav</button>
+        </div>
+      </div>
+
+      <!-- 设备 -->
+      <div class="pane hidden" data-pane="device">
+        <div class="notice" id="device-safety">
+          <strong>设备测试会占用麦克风与扬声器。</strong>
+          <label class="check"><input type="checkbox" id="dev-play"> 允许播放参考音（勾选后才会打开扬声器）</label>
+        </div>
+        <div class="grid2">
+          <label>输入设备<select id="dev-input"><option value="">默认输入</option></select></label>
+          <label>输出设备<select id="dev-output"><option value="">默认输出</option></select></label>
+          <label>采样率
+            <select id="dev-rate">
+              <option value="48000" selected>48000</option>
+              <option value="16000">16000</option>
+              <option value="32000">32000</option>
+            </select>
+          </label>
+          <label>录音时长 (s)<input type="number" id="dev-duration" value="8" min="2" max="60"></label>
+          <label>参考音
+            <select id="dev-ref-source">
+              <option value="speech" selected>类语音（合成）</option>
+              <option value="chirp">短扫频突发</option>
+              <option value="sweep">连续扫频</option>
+              <option value="file">音频文件（推荐用真实 TTS）</option>
+              <option value="silence">静音（只录底噪）</option>
+            </select>
+          </label>
+          <label>播放增益<input type="number" id="dev-gain" value="0.7" min="0" max="1.5" step="0.05"></label>
+        </div>
+        <div class="filepick" id="dev-ref-file-wrap">
+          <div class="filepick-row">
+            <select class="upload-select" id="dev-ref-file"><option value="">— 选择已上传音频 —</option></select>
+            <label class="mini-btn">上传<input type="file" accept="audio/*" class="upload-input" data-target="dev-ref-file"></label>
+          </div>
+          <p class="hint" id="dev-ref-hint">选择 wav/mp3/flac 等，程序会按该文件完整播放一遍作为参考音；
+            文件比「录音时长」长就播完整首，短则放完后继续录静音直到满足时长。</p>
+        </div>
+        <p class="hint">流程：先放 0.3s 静音 → 播放参考音，同时麦克风采集 → 期间说几句话做双讲 → 程序对录音跑 AEC。</p>
+        <div class="row">
+          <button id="btn-devices" class="ghost small-btn">刷新设备列表</button>
+          <label class="check small"><input type="checkbox" id="dev-show-all"> 显示全部后端条目（WASAPI/MME/DirectSound/WDM-KS 会重复）</label>
+        </div>
+        <p class="hint" id="dev-list-hint"></p>
+      </div>
+
+      <!-- 对比 -->
+      <div class="pane hidden" data-pane="compare">
+        <p class="hint">同一份仿真信号，横向比较不同 AEC 配置与延迟设定，找出最佳参数。</p>
+        <div class="grid2">
+          <label>时长 (s)<input type="number" id="cmp-duration" value="6" min="2" max="30"></label>
+          <label>回声延迟 (ms)<input type="number" id="cmp-echo-delay" value="50" min="0" max="300"></label>
+        </div>
+        <div class="chipgroup" id="cmp-presets">
+          <label class="chip"><input type="checkbox" value="off"> 全部关闭</label>
+          <label class="chip"><input type="checkbox" value="aec_only"> 仅 AEC</label>
+          <label class="chip"><input type="checkbox" value="voice_assistant" checked> 语音助手</label>
+          <label class="chip"><input type="checkbox" value="desktop"> 桌面端</label>
+          <label class="chip"><input type="checkbox" value="mobile"> 移动端</label>
+        </div>
+        <div class="grid2">
+          <label>延迟候选 (ms，逗号分隔)<input type="text" id="cmp-delays" value="0,30,60,120,240"></label>
+        </div>
+      </div>
+
+      <div class="row actions">
+        <button id="btn-run" class="primary">开始测试</button>
+        <button id="btn-cancel" class="ghost" disabled>取消</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>AEC 配置</h2>
+      <label>预设
+        <select id="aec-preset">
+          <option value="voice_assistant" selected>语音助手常用（AEC+NS+高通）</option>
+          <option value="aec_only">仅 AEC</option>
+          <option value="off">全部关闭（基线）</option>
+          <option value="desktop">桌面端常用（AEC+NS+AGC）</option>
+          <option value="mobile">移动端模式（mobile AEC）</option>
+          <option value="custom">自定义</option>
+        </select>
+      </label>
+      <div class="switches">
+        <label class="check"><input type="checkbox" id="aec-echo" checked> 回声消除 AEC</label>
+        <label class="check"><input type="checkbox" id="aec-mobile"> mobile AEC</label>
+        <label class="check"><input type="checkbox" id="aec-hp" checked> 高通</label>
+        <label class="check"><input type="checkbox" id="aec-ns" checked> 噪声抑制</label>
+        <label class="check"><input type="checkbox" id="aec-agc1"> AGC1</label>
+        <label class="check"><input type="checkbox" id="aec-agc2"> AGC2</label>
+        <label class="check"><input type="checkbox" id="aec-transient"> 瞬态抑制</label>
+      </div>
+      <div class="grid2">
+        <label>NS 等级
+          <select id="aec-ns-level">
+            <option value="0">Low</option>
+            <option value="1" selected>Moderate</option>
+            <option value="2">High</option>
+            <option value="3">Very High</option>
+          </select>
+        </label>
+        <label>AGC1 模式
+          <select id="aec-agc1-mode">
+            <option value="1" selected>AdaptiveDigital</option>
+            <option value="0">AdaptiveAnalog</option>
+            <option value="2">FixedDigital</option>
+          </select>
+        </label>
+      </div>
+      <div class="delaybox">
+        <label class="check"><input type="checkbox" id="aec-delay-auto"> 自动估计延迟</label>
+        <div class="grid2">
+          <label>手动延迟 (ms)<input type="number" id="aec-delay" value="60" min="0" max="500" step="5"></label>
+          <label>搜索上限 (ms)<input type="number" id="aec-delay-max" value="500" min="50" max="500" step="50"></label>
+        </div>
+      </div>
+      <details class="adv">
+        <summary>输出选项</summary>
+        <label class="check"><input type="checkbox" id="opt-save-in" checked> 保存 AEC 输入（L=mic / R=ref 合轨）</label>
+        <label class="check"><input type="checkbox" id="opt-mute-during-far"> 设备模式播放时静音 mic（仅录制回采）</label>
+      </details>
+    </section>
+  </aside>
+
+  <section class="col-right">
+    <section class="card progress-card">
+      <div class="progress-head">
+        <h2 id="job-title">准备就绪</h2>
+        <span id="job-stage" class="mono small">—</span>
+      </div>
+      <div class="bar"><div id="job-bar" class="bar-fill"></div></div>
+      <div id="job-log" class="log mono"></div>
+    </section>
+
+    <section class="card results-card">
+      <div class="card-head">
+        <h2>测试结果</h2>
+        <div class="row">
+          <button id="btn-results-refresh" class="ghost small-btn">刷新历史</button>
+        </div>
+      </div>
+      <div id="metrics" class="metrics"></div>
+      <div id="compare-table" class="compare-wrap hidden"></div>
+      <div id="artifacts" class="artifacts"></div>
+      <div class="plot-wrap hidden" id="plot-wrap">
+        <img id="plot-img" alt="波形与 ERLE 图">
+      </div>
+      <details class="history" id="history-box" open>
+        <summary>历史结果（output/）</summary>
+        <div id="results-history" class="history-list"><p class="hint">加载中…</p></div>
+      </details>
+    </section>
+  </section>
+</main>
+
+<footer class="footer mono small">
+  WebRTC APM · 支持 Windows / macOS / Linux(x64, arm64 / 树莓派) · 输出目录 output/
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
