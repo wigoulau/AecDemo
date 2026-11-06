@@ -9,6 +9,7 @@ const state = {
   currentJob: null,
   pollTimer: null,
   lastResult: null,
+  uploadInfo: {},
 };
 
 // ---------------------------------------------------------------- 工具
@@ -117,18 +118,50 @@ async function loadDevices() {
 async function loadUploads() {
   try {
     const data = await api('/api/uploads');
+    state.uploadInfo = {};
+    data.items.forEach((it) => { state.uploadInfo[it.file_id] = it; });
     $$('.upload-select').forEach((sel) => {
       const current = sel.value;
       sel.innerHTML = '<option value="">— 选择已上传音频 —</option>';
       data.items.forEach((it) => {
         const opt = document.createElement('option');
         opt.value = it.file_id;
-        opt.textContent = `${it.file_id} (${fmt(it.duration_s, 2)}s)`;
+        const ch = it.channels ? `${it.channels}ch · ` : '';
+        opt.textContent = `${it.file_id} (${ch}${fmt(it.duration_s, 2)}s)`;
         sel.appendChild(opt);
       });
       if (current) sel.value = current;
     });
+    syncFileOneHint();
   } catch (_) {}
+}
+
+function syncFileSourceMode() {
+  const mode = document.querySelector('input[name="file-src"]:checked')?.value || 'stereo';
+  $('#file-single-wrap').classList.toggle('hidden', mode !== 'stereo');
+  $('#file-two-wrap').classList.toggle('hidden', mode !== 'two');
+}
+
+function syncFileOneHint() {
+  const hint = $('#file-one-hint');
+  if (!hint) return;
+  const id = $('#file-one').value;
+  const info = id ? state.uploadInfo?.[id] : null;
+  if (!info) {
+    hint.textContent = '选择文件后这里会显示检测到的声道数。';
+    hint.classList.remove('warn-text');
+    return;
+  }
+  if (info.channels == null) {
+    hint.textContent = '无法探测该文件的声道数（可能 ffmpeg 未安装或格式不受支持）。';
+    hint.classList.add('warn-text');
+  } else if (info.channels < 2) {
+    hint.textContent = `该文件只有 ${info.channels} 个声道，不能用作单文件模式——请改用「两个文件」。`;
+    hint.classList.add('warn-text');
+  } else {
+    hint.textContent = `检测到 ${info.channels} 个声道 · ${fmt(info.duration_s, 2)}s · 请确认 mic/ref 声道选择正确。`;
+    hint.classList.remove('warn-text');
+  }
 }
 
 async function uploadFile(file, targetSel) {
@@ -137,10 +170,17 @@ async function uploadFile(file, targetSel) {
   addLog(`上传 ${file.name} …`);
   const info = await api('/api/upload', { method: 'POST', body: fd });
   if (info.decode_error) addLog(`解码告警: ${info.decode_error}`);
-  else addLog(`已上传 ${info.name} · ${fmt(info.duration_s, 2)}s · RMS ${fmt(info.rms_dbfs, 1)}dBFS`);
+  else {
+    const ch = info.channels ? ` · ${info.channels}ch` : '';
+    addLog(`已上传 ${info.name} · ${fmt(info.duration_s, 2)}s${ch} · RMS ${fmt(info.rms_dbfs, 1)}dBFS`);
+    if (info.channels === 1 && targetSel === 'file-one') {
+      addLog('提示：单声道文件不能用作「一个双声道文件」模式，请改用「两个文件」。');
+    }
+  }
   await loadUploads();
   const sel = $(targetSel.startsWith('#') ? targetSel : `#${targetSel}`);
   if (sel && info.file_id) sel.value = info.file_id;
+  syncFileOneHint();
 }
 
 // ---------------------------------------------------------------- 参数收集
@@ -220,11 +260,29 @@ async function startJob() {
       },
     };
   } else if (state.mode === 'files') {
-    const mic = $('#file-mic').value;
-    const ref = $('#file-ref').value;
-    if (!mic || !ref) return alert('请选择 mic 与 ref 两个音频文件');
-    path = '/api/files';
-    body = { mic_file: mic, ref_file: ref, aec, options };
+    const srcMode = document.querySelector('input[name="file-src"]:checked')?.value || 'stereo';
+    if (srcMode === 'stereo') {
+      const one = $('#file-one').value;
+      if (!one) return alert('请选择一个双声道音频文件');
+      const micCh = parseInt($('#file-mic-ch').value, 10);
+      const refCh = parseInt($('#file-ref-ch').value, 10);
+      if (micCh === refCh) return alert('mic 与 ref 不能选同一个声道');
+      const f = state.uploadInfo?.[one];
+      if (f && f.channels === 1) {
+        return alert('该文件是单声道，无法同时作为 mic 与 ref。请用双声道文件，或改用「两个文件」模式。');
+      }
+      if (f && f.channels && (micCh >= f.channels || refCh >= f.channels)) {
+        return alert(`该文件只有 ${f.channels} 个声道，所选声道超出范围。`);
+      }
+      path = '/api/files';
+      body = { file: one, mic_channel: micCh, ref_channel: refCh, aec, options };
+    } else {
+      const mic = $('#file-mic').value;
+      const ref = $('#file-ref').value;
+      if (!mic || !ref) return alert('请选择 mic 与 ref 两个音频文件');
+      path = '/api/files';
+      body = { mic_file: mic, ref_file: ref, aec, options };
+    }
   } else if (state.mode === 'device') {
     if (!$('#dev-play').checked) {
       return alert('为避免突然出声，请先勾选「允许播放参考音」。若只想录一段回采，请用音频文件模式。');
@@ -590,6 +648,27 @@ function bindFileVis() {
   sync();
 }
 
+function bindFileSource() {
+  $$('input[name="file-src"]').forEach((el) => {
+    el.addEventListener('change', syncFileSourceMode);
+  });
+  $('#file-one')?.addEventListener('change', syncFileOneHint);
+  $('#file-mic-ch')?.addEventListener('change', () => {
+    // 避免误选同一路：选中后把另一侧自动挪开
+    if ($('#file-mic-ch').value === $('#file-ref-ch').value) {
+      const other = ['0', '1', '2', '3'].find((v) => v !== $('#file-mic-ch').value);
+      if (other !== undefined) $('#file-ref-ch').value = other;
+    }
+  });
+  $('#file-ref-ch')?.addEventListener('change', () => {
+    if ($('#file-mic-ch').value === $('#file-ref-ch').value) {
+      const other = ['0', '1', '2', '3'].find((v) => v !== $('#file-ref-ch').value);
+      if (other !== undefined) $('#file-mic-ch').value = other;
+    }
+  });
+  syncFileSourceMode();
+}
+
 function bindUploads() {
   $$('.upload-input').forEach((input) => {
     input.addEventListener('change', async (ev) => {
@@ -634,6 +713,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   bindTabs();
   bindPreset();
   bindFileVis();
+  bindFileSource();
   bindUploads();
   bindActions();
   bindDeviceLazy();

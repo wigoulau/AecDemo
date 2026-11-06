@@ -28,7 +28,7 @@ from .config import (
     RunOptions,
     SimulateSettings,
 )
-from .runner import JOBS, run_compare, run_device, run_files, run_simulation
+from .runner import JOBS, run_compare, run_device, run_files, run_files_stereo, run_simulation
 
 app = FastAPI(title="AEC Demo", version="1.0.0")
 
@@ -47,8 +47,17 @@ class SimRequest(BaseModel):
 
 
 class FileRequest(BaseModel):
-    mic_file: str
-    ref_file: str
+    """文件模式请求：两种写法二选一.
+
+    - 双文件：`mic_file` + `ref_file`
+    - 单文件：`file`（多声道，默认 ch0=mic / ch1=ref），可选 `mic_channel`/`ref_channel`
+    """
+
+    mic_file: str = ""
+    ref_file: str = ""
+    file: str = ""
+    mic_channel: int = 0
+    ref_channel: int = 1
     aec: Dict[str, Any] = Field(default_factory=dict)
     options: Dict[str, Any] = Field(default_factory=dict)
     mic_rate: Optional[int] = None
@@ -101,6 +110,32 @@ def _upload_path(file_id: str) -> Path:
     if UPLOAD_DIR.resolve() not in p.parents or not p.exists():
         raise HTTPException(404, "文件不存在")
     return p
+
+
+_CHANNEL_CACHE: Dict[str, int] = {}
+
+
+def _probe_channels(path: Path) -> Optional[int]:
+    """探测音频声道数（缓存，只读文件头，不整段解码）."""
+    key = str(path)
+    if key in _CHANNEL_CACHE:
+        return _CHANNEL_CACHE[key]
+    ch: Optional[int] = None
+    try:
+        import soundfile as sf
+
+        ch = int(sf.info(str(path)).channels)
+    except Exception:
+        try:
+            import wave
+
+            with wave.open(str(path), "rb") as wf:
+                ch = int(wf.getnchannels())
+        except Exception:
+            ch = None
+    if ch is not None:
+        _CHANNEL_CACHE[key] = ch
+    return ch
 
 
 def _resolve_sim_files(sim: SimulateSettings) -> SimulateSettings:
@@ -323,10 +358,13 @@ async def upload(file: UploadFile = File(...)) -> Dict[str, Any]:
             fh.write(chunk)
     info: Dict[str, Any] = {"file_id": dest.name, "name": file.filename, "size": size}
     try:
-        from .audioio import read_audio
+        from .audioio import read_audio_multi
 
-        x = read_audio(dest, 16000)
+        raw = read_audio_multi(dest, 16000)
+        x = raw if raw.ndim == 1 else raw.mean(axis=1, dtype=np.float32)
+        channels = 1 if raw.ndim == 1 else int(raw.shape[1])
         info.update({"duration_s": round(len(x) / 16000, 2), "sampled_at_16k": len(x),
+                     "channels": channels,
                      "peak": round(float(np.max(np.abs(x))) if len(x) else 0.0, 4),
                      "rms_dbfs": round(float(20 * np.log10(max(float(np.sqrt(np.mean(x**2))), 1e-6))), 1)})
     except Exception as exc:
@@ -340,7 +378,8 @@ def list_uploads() -> Dict[str, Any]:
     for p in sorted(UPLOAD_DIR.glob("up_*"), key=lambda x: -x.stat().st_mtime):
         items.append({"file_id": p.name, "name": p.name,
                       "duration_s": round(duration_s(p), 2),
-                      "size": p.stat().st_size})
+                      "size": p.stat().st_size,
+                      "channels": _probe_channels(p)})
     return {"items": items}
 
 
@@ -359,10 +398,27 @@ def start_simulate(req: SimRequest) -> Dict[str, Any]:
 
 @app.post("/api/files")
 def start_files(req: FileRequest) -> Dict[str, Any]:
-    mic = str(_upload_path(req.mic_file))
-    ref = str(_upload_path(req.ref_file))
     aec = _aec(req.aec)
     opts = _merge(RunOptions(), req.options)
+
+    if req.file:
+        # 单文件模式：一个多声道文件，按声道拆 mic/ref
+        path = str(_upload_path(req.file))
+        if req.mic_channel == req.ref_channel:
+            raise HTTPException(400, "mic 与 ref 不能是同一个声道")
+        if req.mic_channel < 0 or req.ref_channel < 0:
+            raise HTTPException(400, "声道索引不能为负")
+        job = JOBS.submit(
+            "files",
+            f"文件 {Path(path).name} ch{req.mic_channel + 1}=mic / ch{req.ref_channel + 1}=ref",
+            lambda j: run_files_stereo(j, path, aec, opts, req.mic_channel, req.ref_channel),
+        )
+        return job.to_dict()
+
+    if not req.mic_file or not req.ref_file:
+        raise HTTPException(400, "请提供「一个多声道文件」或「mic + ref 两个文件」")
+    mic = str(_upload_path(req.mic_file))
+    ref = str(_upload_path(req.ref_file))
     job = JOBS.submit(
         "files", f"文件 {Path(mic).name} + {Path(ref).name}",
         lambda j: run_files(j, mic, ref, aec, opts, req.mic_rate, req.ref_rate),

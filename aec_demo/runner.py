@@ -15,7 +15,7 @@ import numpy as np
 
 from .aec import AecCore, estimate_delay_ms
 from .analysis import compute_metrics, make_plot, save_metrics
-from .audioio import read_audio, write_wav
+from .audioio import read_audio, read_audio_multi, write_wav
 from .config import (
     AecSettings,
     OUTPUT_DIR,
@@ -332,7 +332,61 @@ def run_files(
     job.log(f"ref: {ref_path}")
     mic = read_audio(mic_path, rate)
     ref = read_audio(ref_path, rate)
-    job.log(f"毫秒长度: mic={len(mic)/rate*1000:.0f}ms, ref={len(ref)/rate*1000:.0f}ms")
+    _run_files_core(job, out_dir, rate, mic, ref, aec, options,
+                    src_desc=f"{Path(mic_path).name} + {Path(ref_path).name}")
+
+
+def run_files_stereo(
+    job: Job,
+    path: str,
+    aec: AecSettings,
+    options: RunOptions,
+    mic_channel: int = 0,
+    ref_channel: int = 1,
+) -> None:
+    """单文件模式：一个多声道文件，按声道拆出 mic / ref.
+
+    `aec_in.wav` 那种 L=mic / R=ref 的合轨文件可以直接喂进来。
+    """
+    out_dir = run_dir(job)
+    job.stage = "读取音频"
+    job.progress = 0.05
+    rate = int(aec.rate)
+    job.log(f"文件: {path}（第 {mic_channel + 1} 声道 = mic，第 {ref_channel + 1} 声道 = ref）")
+
+    data = read_audio_multi(path, rate)
+    channels = 1 if data.ndim == 1 else data.shape[1]
+    job.log(f"检测到 {channels} 个声道")
+    if channels < 2:
+        raise ValueError(
+            f"该文件只有 {channels} 个声道，无法同时提供 mic 与 ref。"
+            "请用双声道文件（如 L=mic / R=ref），或改用「两个文件」模式。"
+        )
+    for name, idx in (("mic", mic_channel), ("ref", ref_channel)):
+        if not 0 <= idx < channels:
+            raise ValueError(f"{name} 声道索引 {idx} 超出范围（文件共 {channels} 声道）")
+    if mic_channel == ref_channel:
+        raise ValueError("mic 与 ref 不能是同一个声道，否则 AEC 拿到的两路信号相同")
+
+    mic = np.ascontiguousarray(data[:, mic_channel], dtype=np.float32)
+    ref = np.ascontiguousarray(data[:, ref_channel], dtype=np.float32)
+    name = Path(path).name
+    _run_files_core(job, out_dir, rate, mic, ref, aec, options,
+                    src_desc=f"{name} [ch{mic_channel + 1}=mic / ch{ref_channel + 1}=ref]")
+
+
+def _run_files_core(
+    job: Job,
+    out_dir: Path,
+    rate: int,
+    mic: np.ndarray,
+    ref: np.ndarray,
+    aec: AecSettings,
+    options: RunOptions,
+    src_desc: str,
+) -> None:
+    """文件模式的公共后半段：对齐 → 延迟 → AEC → 指标 → 产物."""
+    job.log(f"时长: mic={len(mic)/rate*1000:.0f}ms, ref={len(ref)/rate*1000:.0f}ms")
     n = min(len(mic), len(ref))
     if n < frame_samples(rate) * 10:
         raise ValueError("音频过短（不足 100ms），无法评估 AEC")
@@ -365,8 +419,7 @@ def run_files(
     mic_db, out_db = metrics["segments"]["all"]["mic_dbfs"], metrics["segments"]["all"]["out_dbfs"]
     metrics["summary"]["level_change_db"] = round(out_db - mic_db, 2)
     metrics["aec_stats"] = stats
-    metrics["config"] = {"files": {"mic": str(mic_path), "ref": str(ref_path)},
-                         "aec": settings.to_dict()}
+    metrics["config"] = {"source": src_desc, "aec": settings.to_dict()}
     job.log("提示：文件模式无真值，ERLE 为 mic→out 的整体抑制量；"
             "若 mic 中含人声，ERLE 会被拉低")
 
@@ -375,7 +428,7 @@ def run_files(
     arts = _save_outputs(out_dir, rate, mic, ref, out, options)
     arts += _add_plot_and_metrics(
         out_dir, rate, ref, mic, out, metrics, segments,
-        f"[文件] {Path(mic_path).name}", None,
+        f"[文件] {src_desc}", None,
     )
     job.result = {
         "dir": out_dir.name,

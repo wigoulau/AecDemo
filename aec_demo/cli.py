@@ -51,6 +51,27 @@ def cmd_simulate(args: argparse.Namespace) -> int:
     return 0 if job.status == "done" else 1
 
 
+def cmd_files(args: argparse.Namespace) -> int:
+    from .runner import Job, run_files, run_files_stereo
+
+    aec = AecSettings(preset=args.preset, delay_ms=args.delay, delay_auto=args.auto_delay)
+    job = Job(id="cli", kind="files", title="CLI 文件")
+    try:
+        if args.file:
+            run_files_stereo(job, args.file, aec, RunOptions(),
+                             mic_channel=args.mic_channel, ref_channel=args.ref_channel)
+        else:
+            run_files(job, args.mic, args.ref, aec, RunOptions())
+    except Exception as exc:  # noqa: BLE001 - CLI 直接报错即可
+        print(f"失败: {exc}")
+        return 1
+    print("\n".join(job.logs))
+    print(f"\n产物目录: {OUTPUT_DIR / job.result.get('dir', '')}")
+    for a in job.result.get("artifacts", []):
+        print(f"  - {a['label']}: {a['name']}")
+    return 0 if job.status == "done" else 1
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -76,12 +97,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--delay", type=int, default=60, help="AEC 设定的流延迟 ms")
     parser.add_argument("--auto-delay", action="store_true", help="自动估计延迟")
     parser.add_argument("--preset", default="voice_assistant", choices=sorted(PRESETS))
+    parser.add_argument("--files", action="store_true",
+                        help="无界面跑一次文件模式（需配合 --file 或 --mic/--ref）")
+    parser.add_argument("--file", default="", help="单文件模式：多声道文件，按声道拆 mic/ref")
+    parser.add_argument("--mic-channel", type=int, default=0, help="单文件模式：mic 声道索引（0 起）")
+    parser.add_argument("--ref-channel", type=int, default=1, help="单文件模式：ref 声道索引（0 起）")
+    parser.add_argument("--mic", default="", help="双文件模式：mic 文件")
+    parser.add_argument("--ref", default="", help="双文件模式：ref 文件")
     args = parser.parse_args(argv)
 
     if args.selftest:
         return cmd_selftest()
     if args.simulate:
         return cmd_simulate(args)
+    if args.files:
+        if not args.file and not (args.mic and args.ref):
+            parser.error("--files 需要 --file，或同时给 --mic 与 --ref")
+        return cmd_files(args)
     return cmd_serve(args)
 
 

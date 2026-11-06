@@ -94,22 +94,59 @@
 
       <!-- 文件 -->
       <div class="pane hidden" data-pane="files">
-        <p class="hint">上传或选择两路<strong>同一时间轴</strong>的 WAV：mic = 麦克风录制（含回声），ref = 当时扬声器播放的信号。</p>
-        <div class="filepick-row">
-          <label>mic 文件
-            <select class="upload-select" id="file-mic"><option value="">— 选择上传文件 —</option></select>
-          </label>
-          <label class="mini-btn">上传<input type="file" accept="audio/*" class="upload-input" data-target="file-mic"></label>
+        <div class="chipgroup" id="file-source-mode">
+          <label class="chip"><input type="radio" name="file-src" value="stereo" checked> 一个双声道文件</label>
+          <label class="chip"><input type="radio" name="file-src" value="two"> 两个文件</label>
         </div>
-        <div class="filepick-row">
-          <label>ref 文件
-            <select class="upload-select" id="file-ref"><option value="">— 选择上传文件 —</option></select>
-          </label>
-          <label class="mini-btn">上传<input type="file" accept="audio/*" class="upload-input" data-target="file-ref"></label>
+
+        <div id="file-single-wrap">
+          <p class="hint">上传<strong>一个多声道文件</strong>，程序按声道拆成 mic / ref — 两路天然同一时间轴。
+            output 目录里的 <code>aec_in.wav</code> 就是这种格式，可直接用。</p>
+          <div class="filepick-row">
+            <label>音频文件
+              <select class="upload-select" id="file-one"><option value="">— 选择上传文件 —</option></select>
+            </label>
+            <label class="mini-btn">上传<input type="file" accept="audio/*" class="upload-input" data-target="file-one"></label>
+          </div>
+          <div class="grid2">
+            <label>mic 声道
+              <select id="file-mic-ch">
+                <option value="0" selected>第 1 声道 (L)</option>
+                <option value="1">第 2 声道 (R)</option>
+                <option value="2">第 3 声道</option>
+                <option value="3">第 4 声道</option>
+              </select>
+            </label>
+            <label>ref 声道
+              <select id="file-ref-ch">
+                <option value="0">第 1 声道 (L)</option>
+                <option value="1" selected>第 2 声道 (R)</option>
+                <option value="2">第 3 声道</option>
+                <option value="3">第 4 声道</option>
+              </select>
+            </label>
+          </div>
+          <p class="hint" id="file-one-hint">选择文件后这里会显示检测到的声道数。</p>
         </div>
-        <p class="hint warn-text">没有现成素材？先用「离线仿真」跑一次，output 目录里的 <code>aec_in.wav</code> 是 L=mic/R=ref 的合轨文件，可拆出来当输入。</p>
+
+        <div id="file-two-wrap" class="hidden">
+          <p class="hint">上传或选择两路<strong>同一时间轴</strong>的单声道文件：mic = 麦克风录制（含回声），ref = 当时扬声器播放的信号。</p>
+          <div class="filepick-row">
+            <label>mic 文件
+              <select class="upload-select" id="file-mic"><option value="">— 选择上传文件 —</option></select>
+            </label>
+            <label class="mini-btn">上传<input type="file" accept="audio/*" class="upload-input" data-target="file-mic"></label>
+          </div>
+          <div class="filepick-row">
+            <label>ref 文件
+              <select class="upload-select" id="file-ref"><option value="">— 选择上传文件 —</option></select>
+            </label>
+            <label class="mini-btn">上传<input type="file" accept="audio/*" class="upload-input" data-target="file-ref"></label>
+          </div>
+        </div>
+
         <div class="row">
-          <button id="btn-download-aec-in" class="ghost small-btn">下载最近一次 aec_in.wav</button>
+          <button id="btn-download-aec-in" class="ghost small-btn">下载最近一次 aec_in.wav（可直接用上面的单文件模式）</button>
         </div>
       </div>
 
