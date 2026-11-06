@@ -10,6 +10,7 @@ const state = {
   pollTimer: null,
   lastResult: null,
   uploadInfo: {},
+  devices: null,
 };
 
 // ---------------------------------------------------------------- 工具
@@ -86,23 +87,23 @@ async function loadDevices() {
     const label = (dev) => (showAll
       ? `${dev.index}: ${dev.name} [${dev.hostapi_name}]`
       : `${dev.name}`);
-    d.inputs.forEach((dev) => {
+    const addOpt = (sel, dev) => {
       const opt = document.createElement('option');
       opt.value = dev.index;
+      opt.dataset.key = dev.key || '';
       opt.textContent = label(dev);
-      inSel.appendChild(opt);
-    });
-    d.outputs.forEach((dev) => {
-      const opt = document.createElement('option');
-      opt.value = dev.index;
-      opt.textContent = label(dev);
-      outSel.appendChild(opt);
-    });
+      sel.appendChild(opt);
+    };
+    d.inputs.forEach((dev) => addOpt(inSel, dev));
+    d.outputs.forEach((dev) => addOpt(outSel, dev));
     // 刷新后尽量保留用户原来的选择
     if (keepIn && [...inSel.options].some((o) => o.value === keepIn)) inSel.value = keepIn;
     else if (d.default_input !== null && d.default_input !== undefined && d.default_input >= 0) inSel.value = d.default_input;
     if (keepOut && [...outSel.options].some((o) => o.value === keepOut)) outSel.value = keepOut;
     else if (d.default_output !== null && d.default_output !== undefined && d.default_output >= 0) outSel.value = d.default_output;
+
+    state.devices = d;
+    syncDeviceRates();
 
     const hint = $('#dev-list-hint');
     if (hint) {
@@ -112,6 +113,40 @@ async function loadDevices() {
     }
   } catch (e) {
     addLog(`设备列表获取失败: ${e.message}`);
+  }
+}
+
+// WASAPI 共享模式下设备只接受原生采样率；界面据此标注并自动选一个能用的值
+function syncDeviceRates() {
+  const d = state.devices;
+  const rateSel = $('#dev-rate');
+  if (!d || !rateSel) return;
+  const find = (list, val) => (val === '' ? null : (list || []).find((x) => String(x.index) === String(val)));
+  const ins = find(d.inputs, $('#dev-input').value);
+  const outs = find(d.outputs, $('#dev-output').value);
+  const note = $('#dev-rate-hint');
+  const natives = [ins?.native_rate, outs?.native_rate].filter(Boolean);
+
+  [...rateSel.options].forEach((opt) => {
+    const r = parseInt(opt.value, 10);
+    const isNative = natives.includes(r);
+    opt.textContent = isNative ? `${r}（设备原生）` : `${r}（需重采样）`;
+  });
+
+  // 当前选的采样率两个设备都支持时不动它
+  const cur = parseInt(rateSel.value, 10);
+  const curOk = !natives.length || natives.includes(cur);
+  if (!curOk) {
+    const pick = natives.find((r) => [...rateSel.options].some((o) => parseInt(o.value, 10) === r));
+    if (pick) {
+      rateSel.value = String(pick);
+      addLog(`采样率已自动切到 ${pick}Hz（所选设备的原生采样率）`);
+    }
+  }
+  if (note) {
+    note.textContent = natives.length
+      ? `设备原生采样率 ${[...new Set(natives)].join(' / ')}Hz；其它采样率由 WASAPI 自动重采样，可能引入轻微延迟。`
+      : '未选择具体设备时使用系统默认，任意支持的采样率均可。';
   }
 }
 
@@ -292,11 +327,14 @@ async function startJob() {
     path = '/api/device';
     const inDev = $('#dev-input').value;
     const outDev = $('#dev-output').value;
+    const devKey = (selId) => $(selId)?.selectedOptions?.[0]?.dataset?.key || null;
     body = {
       aec: { ...aec, rate: parseInt($('#dev-rate').value, 10) },
       options,
       input_device: inDev === '' ? null : parseInt(inDev, 10),
       output_device: outDev === '' ? null : parseInt(outDev, 10),
+      input_device_key: devKey('#dev-input'),
+      output_device_key: devKey('#dev-output'),
       device_rate: parseInt($('#dev-rate').value, 10),
       play: true,
       duration_s: num('#dev-duration', 8),
@@ -690,6 +728,8 @@ function bindActions() {
   $('#btn-refresh').addEventListener('click', () => { loadHealth(); loadDevices(); loadUploads(); });
   $('#btn-devices').addEventListener('click', loadDevices);
   $('#dev-show-all')?.addEventListener('change', loadDevices);
+  $('#dev-input')?.addEventListener('change', syncDeviceRates);
+  $('#dev-output')?.addEventListener('change', syncDeviceRates);
   $('#btn-results-refresh').addEventListener('click', loadResults);
   $('#btn-download-aec-in')?.addEventListener('click', () => {
     const url = state.lastResult?.dir ? `/files/${state.lastResult.dir}/aec_in.wav` : null;

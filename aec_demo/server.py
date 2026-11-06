@@ -19,6 +19,7 @@ from . import apm
 from .audioio import duration_s, resample, write_wav
 from .config import (
     CACHE_DIR,
+    DEVICE_RATES,
     OUTPUT_DIR,
     PRESETS,
     ROOT,
@@ -27,6 +28,7 @@ from .config import (
     AecSettings,
     RunOptions,
     SimulateSettings,
+    nearest_apm_rate,
 )
 from .runner import JOBS, run_compare, run_device, run_files, run_files_stereo, run_simulation
 
@@ -70,6 +72,8 @@ class DeviceRequest(BaseModel):
     simulate: Dict[str, Any] = Field(default_factory=dict)
     input_device: Optional[int] = None
     output_device: Optional[int] = None
+    input_device_key: Optional[str] = None
+    output_device_key: Optional[str] = None
     device_rate: int = 48000
     play: bool = False
     duration_s: float = 6.0
@@ -178,6 +182,7 @@ def devices(all: bool = False) -> Dict[str, Any]:
             api = hostapis[d["hostapi"]]["name"] if d["hostapi"] < len(hostapis) else ""
             items.append({
                 "index": idx,
+                "key": f"{api}|{d['name']}",
                 "name": _clean_dev_name(d["name"]),
                 "raw_name": d["name"],
                 "hostapi": d["hostapi"],
@@ -185,6 +190,7 @@ def devices(all: bool = False) -> Dict[str, Any]:
                 "max_input_channels": d["max_input_channels"],
                 "max_output_channels": d["max_output_channels"],
                 "default_samplerate": d["default_samplerate"],
+                "native_rate": int(round(float(d["default_samplerate"] or 0))) or None,
             })
 
         if all:
@@ -197,7 +203,8 @@ def devices(all: bool = False) -> Dict[str, Any]:
         return {"available": True, "inputs": ins, "outputs": outs,
                 "default_input": _match_default(items, ins, default_in),
                 "default_output": _match_default(items, outs, default_out),
-                "hostapis": hostapis, "raw_count": len(items)}
+                "hostapis": hostapis, "raw_count": len(items),
+                "rates": list(DEVICE_RATES)}
     except Exception as exc:
         return {"available": False, "error": str(exc), "inputs": [], "outputs": []}
 
@@ -258,9 +265,9 @@ def _is_junk(dev: Dict[str, Any]) -> bool:
     low = name.lower()
     if any(alias in low for alias in _ALIAS_NAMES):
         return True                       # 「主声音驱动」等默认设备别名
-    # WDM-KS 还会列出没有型号的裸设备（`麦克风` / `Speakers` / `耳机`），
-    # 无法判断是哪台硬件，且与 WASAPI 条目功能重复
-    if _dev_priority(dev["hostapi_name"]) >= 3 and not _distinct_tokens(name):
+    # WDM-KS 在 Windows 上可以打开流却永远不来数据（`WdmSyncIoctl` 报错、
+    # 断开的蓝牙耳机残留条目等），默认整块隐藏，只在「显示全部」里出现。
+    if _dev_priority(dev["hostapi_name"]) >= 3:
         return True
     return False
 
@@ -428,9 +435,16 @@ def start_files(req: FileRequest) -> Dict[str, Any]:
 
 @app.post("/api/device")
 def start_device(req: DeviceRequest) -> Dict[str, Any]:
-    if req.device_rate not in SUPPORTED_RATES:
-        raise HTTPException(400, f"device_rate 需为 {SUPPORTED_RATES}")
-    aec = _aec(req.aec)
+    # 设备流可以用设备原生采样率（WASAPI 常为 44100），但 APM 只接受 8/16/32/48k；
+    # run_device 会在 AEC 之前重采样，所以这里的 aec.rate 也要落到 APM 采样率上。
+    if req.device_rate not in DEVICE_RATES:
+        raise HTTPException(400, f"device_rate 需为 {DEVICE_RATES}")
+    aec_patch = dict(req.aec or {})
+    if aec_patch.get("rate") is not None:
+        aec_patch["rate"] = nearest_apm_rate(int(aec_patch["rate"]))
+    else:
+        aec_patch["rate"] = nearest_apm_rate(req.device_rate)
+    aec = _aec(aec_patch)
     opts = _merge(RunOptions(), req.options)
     sim = SimulateSettings(**{**SimulateSettings().to_dict(), "rate": req.device_rate,
                               **{k: v for k, v in req.simulate.items()
@@ -442,7 +456,7 @@ def start_device(req: DeviceRequest) -> Dict[str, Any]:
         f"设备实测 {'播放参考音' if req.play else '仅录音'} @{req.device_rate}Hz",
         lambda j: run_device(j, aec, opts, sim, req.input_device, req.output_device,
                              req.device_rate, req.play, req.duration_s, req.play_gain,
-                             req.input_channels),
+                             req.input_channels, req.input_device_key, req.output_device_key),
     )
     return job.to_dict()
 

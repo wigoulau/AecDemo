@@ -12,6 +12,9 @@ STATIC_DIR = ROOT / "webui"
 
 # WebRTC APM 支持的采样率（必须是 10ms 帧的整数倍）
 SUPPORTED_RATES = (8000, 16000, 32000, 48000)
+# 设备流可以开在 44100（WASAPI 共享模式下虚拟声卡的常见原生率），
+# 进 AEC 之前会重采样到最近的 APM 采样率。
+DEVICE_RATES = (8000, 16000, 32000, 44100, 48000)
 DEFAULT_RATE = 16000
 FRAME_MS = 10
 
@@ -23,6 +26,14 @@ def frame_samples(rate: int) -> int:
 
 def supported_channels(rate: int) -> int:
     return 2 if rate == 48000 else 1
+
+
+def nearest_apm_rate(rate: int) -> int:
+    """把任意采样率映射到 APM 支持的最近采样率（44100 → 48000）."""
+    rate = int(rate)
+    if rate in SUPPORTED_RATES:
+        return rate
+    return min(SUPPORTED_RATES, key=lambda r: abs(r - rate))
 
 
 PRESETS: Dict[str, Dict[str, Any]] = {

@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import traceback
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .aec import AecCore, estimate_delay_ms
 from .analysis import compute_metrics, make_plot, save_metrics
-from .audioio import read_audio, read_audio_multi, write_wav
+from .audioio import read_audio, read_audio_multi, resample, write_wav
 from .config import (
     AecSettings,
     OUTPUT_DIR,
@@ -23,6 +24,7 @@ from .config import (
     RunOptions,
     SimulateSettings,
     frame_samples,
+    nearest_apm_rate,
 )
 from .simulate import ref_audio_for_device, simulate
 
@@ -445,6 +447,315 @@ def _run_files_core(
 # --------------------------------------------------------------------------
 # 设备实测（会占用麦克风，扬声器仅在显式允许时打开）
 # --------------------------------------------------------------------------
+def _resolve_index(sd, device, side: str) -> Optional[int]:
+    """把 None（=系统默认）解析成具体设备索引；side 为 'in' 或 'out'."""
+    idx = device
+    if idx is None:
+        try:
+            idx = sd.default.device[0] if side == "in" else sd.default.device[1]
+        except Exception:
+            return None
+    try:
+        idx = int(idx)
+    except Exception:
+        return None
+    return idx if idx >= 0 else None
+
+
+def _device_key(sd, idx) -> Optional[str]:
+    """设备的稳定标识「后端名|设备名」. PortAudio 的数字索引会随插拔漂移."""
+    try:
+        d = sd.query_devices(int(idx))
+        api = sd.query_hostapis(int(d["hostapi"]))["name"]
+        return f"{api}|{d['name']}"
+    except Exception:
+        return None
+
+
+def _resolve_device(sd, index, key: Optional[str], side: str) -> Optional[int]:
+    """在当前设备枚举里重新定位设备：优先用 key，其次退回数字索引.
+
+    前端页面打开后若插拔过设备，PortAudio 会重新编号，旧的数字索引可能指向
+    另一台（甚至另一个后端的）设备——之前 WDM-KS 的 `WdmSyncIoctl` 报错
+    就是这么来的。
+    """
+    try:
+        all_devs = sd.query_devices()
+    except Exception:
+        return int(index) if index is not None else None
+    want_in = side == "in"
+
+    def usable(d):
+        return d["max_input_channels"] > 0 if want_in else d["max_output_channels"] > 0
+
+    if key:
+        for i, d in enumerate(all_devs):
+            if not usable(d):
+                continue
+            if _device_key(sd, i) == key:
+                return i
+    if index is not None:
+        try:
+            i = int(index)
+            if 0 <= i < len(all_devs) and usable(all_devs[i]):
+                return i
+        except Exception:
+            pass
+    return None
+
+
+def _hostapi_name(sd, idx) -> str:
+    try:
+        return sd.query_hostapis(int(sd.query_devices(int(idx))["hostapi"]))["name"]
+    except Exception:
+        return ""
+
+
+def _norm_dev_name(name: str) -> str:
+    """设备名归一化：去掉驱动路径 / 转义符，只留可比对的硬件型号."""
+    s = str(name)
+    # `耳机 (@System32\drivers\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0;(TWS-Q6.))`
+    s = re.sub(r"@[^;]*;", "", s)
+    s = re.sub(r"%\d+", "", s)
+    s = s.replace("\\", " ")
+    s = " ".join(s.split())
+    groups = re.findall(r"\(([^()]*)\)", s)
+    head = s.split("(", 1)[0].strip()
+    if head and groups:
+        tail = groups[-1].strip().rstrip(".").strip()
+        return f"{head} ({tail})" if tail else head
+    return s
+
+
+def _alt_backend_indices(sd, idx, side: str) -> List[int]:
+    """同一硬件在其它后端下的索引（WDM-KS 在 Windows 上很不稳，需要备选）."""
+    if idx is None:
+        return []
+    try:
+        raw = sd.query_devices(int(idx))
+        name = raw["name"]
+        norm = _norm_dev_name(name)
+        cur_api = _hostapi_name(sd, idx)
+    except Exception:
+        return []
+    want_in = side == "in"
+    out = []
+    for i, d in enumerate(sd.query_devices()):
+        if i == idx:
+            continue
+        if want_in and d["max_input_channels"] <= 0:
+            continue
+        if not want_in and d["max_output_channels"] <= 0:
+            continue
+        same = d["name"] == name or _norm_dev_name(d["name"]) == norm
+        if not same:
+            # WDM-KS 的蓝牙名带驱动路径，用「末段型号」再兜一层
+            tail = re.findall(r"\(([^()]*)\)", str(d["name"]))
+            core = tail[-1].strip(" .;") if tail else ""
+            if not core or not norm.endswith(f"({core})"):
+                continue
+        api = _hostapi_name(sd, i)
+        if api == cur_api or "wdm-ks" in api.lower():
+            continue
+        out.append(i)
+    return out
+
+
+def _dev_label(sd, idx) -> str:
+    if idx is None:
+        return ""
+    try:
+        d = sd.query_devices(int(idx))
+        return f"{int(idx)}:{d['name']}"
+    except Exception:
+        return str(idx)
+
+
+def _no_audio_hint(sd, input_device, output_device, rate) -> str:
+    """流能打开却一帧数据都没有时，给出可操作的排查方向."""
+    parts = [f"没有采集到音频（{rate}Hz）。"]
+    for side, dev in (("输入", input_device), ("输出", output_device)):
+        api = _hostapi_name(sd, dev) if dev is not None else ""
+        if "wdm-ks" in api.lower():
+            parts.append(f"{side}设备用的是 WDM-KS 后端（{_dev_label(sd, dev)}），"
+                         f"该后端在 Windows 上经常能打开流但不来数据。"
+                         f"请在设备下拉里改用同名设备的 WASAPI 条目。")
+    if len(parts) == 1:
+        parts.append("请确认设备未被其它程序独占、麦克风权限已开启，或换一台设备重试。")
+    return "".join(parts)
+
+
+def _short_err(exc: Optional[Exception], limit: int = 110) -> str:
+    if exc is None:
+        return "未知错误"
+    msg = " ".join(str(exc).split())
+    return msg if len(msg) <= limit else msg[: limit - 1] + "…"
+
+
+def _stream_attempts(sd, input_device, output_device, rate, extra):
+    """按成功率从高到低生成候选方案 (in, out, rate, extra, 说明).
+
+    顺序：
+    1. 用户选择（先用稳定的设备名重新定位，索引可能已漂移）
+    2. 同一硬件换到非 WDM-KS 后端（WDM-KS 在 Windows 上 start() 常失败）
+    3. 设备原生采样率
+    4. 换后端 + 原生采样率
+    """
+    rin = _resolve_device(sd, input_device, None, "in")
+    rout = _resolve_device(sd, output_device, None, "out")
+    attempts = []
+
+    def add(i, o, r, ex, why):
+        attempts.append((i, o, r, ex, list(why)))
+
+    add(rin, rout, rate, extra, [])
+    native = _native_rate(sd, rout if rout is not None else rin, rate)
+
+    # 后端替换：只针对当前指向 WDM-KS 的那一侧
+    alt_in = _alt_backend_indices(sd, rin, "in") if "wdm-ks" in _hostapi_name(sd, rin).lower() else []
+    alt_out = _alt_backend_indices(sd, rout, "out") if "wdm-ks" in _hostapi_name(sd, rout).lower() else []
+    for ai in (alt_in or [rin]):
+        for ao in (alt_out or [rout]):
+            if (ai, ao) == (rin, rout):
+                continue
+            why = []
+            if ai != rin:
+                why.append(f"输入换到 {_hostapi_name(sd, ai)}")
+            if ao != rout:
+                why.append(f"输出换到 {_hostapi_name(sd, ao)}")
+            add(ai, ao, rate, _wasapi_settings(sd, ai, ao, rate), why)
+
+    if native and native != rate:
+        add(rin, rout, native, _wasapi_settings(sd, rin, rout, native),
+            [f"改用设备原生采样率 {native}Hz"])
+        for ai in (alt_in or [rin]):
+            for ao in (alt_out or [rout]):
+                if (ai, ao) == (rin, rout):
+                    continue
+                add(ai, ao, native, _wasapi_settings(sd, ai, ao, native),
+                    [f"输入/输出换后端", f"原生采样率 {native}Hz"])
+
+    # 去重，保持顺序
+    seen, out = set(), []
+    for a in attempts:
+        k = (a[0], a[1], a[2])
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(a)
+    return out
+
+
+def _uses_wasapi(sd, device, side: str = "in") -> bool:
+    """指定设备（None 表示该系统侧的默认设备）是否走 WASAPI 后端."""
+    try:
+        idx = _resolve_index(sd, device, side)
+        if idx is None:
+            return False
+        hostapi = int(sd.query_devices(idx)["hostapi"])
+        return "wasapi" in sd.query_hostapis(hostapi)["name"].lower()
+    except Exception:
+        return False
+
+
+def _wasapi_settings(sd, input_device=None, output_device=None, rate=None):
+    """WASAPI 共享模式只接受设备原生采样率，且常只支持 2 声道.
+
+    不开启 auto_convert 时，44.1k 虚拟声卡/16k 无法直接打开，会报
+    `AUDCLNT_E_UNSUPPORTED_FORMAT`。开启后由 WASAPI 内部转换，任意采样率可用。
+    输入/输出只要有一侧是 WASAPI 就返回配对设置；两侧都不是则返回 None。
+    """
+    in_wasapi = _uses_wasapi(sd, input_device, "in")
+    out_wasapi = _uses_wasapi(sd, output_device, "out")
+    if not (in_wasapi or out_wasapi):
+        return None
+    try:
+        conv = sd.WasapiSettings(auto_convert=True)
+    except Exception:
+        return None
+    return (conv if in_wasapi else None, conv if out_wasapi else None)
+
+
+def _native_rate(sd, device, rate) -> Optional[int]:
+    """设备的原生采样率候选（用于格式不支持时的降级重试），排除已试过的."""
+    try:
+        cands = []
+        if device is not None:
+            cands.append(int(round(float(sd.query_devices(int(device))["default_samplerate"]))))
+        else:
+            for idx in sd.default.device:
+                if idx is not None and int(idx) >= 0:
+                    cands.append(int(round(float(sd.query_devices(int(idx))["default_samplerate"]))))
+        for r in cands:
+            if r != rate:
+                return r
+    except Exception:
+        pass
+    return {48000: 44100, 44100: 48000}.get(rate)
+
+
+def _check_stream_format(sd, rate: int, input_device, output_device,
+                         input_channels: int, extra=None) -> bool:
+    """只查能力不打开流：这对设备能否以 rate + extra 同时收发."""
+    try:
+        sd.check_input_settings(device=input_device, channels=max(1, int(input_channels)),
+                                samplerate=rate, dtype="float32",
+                                extra_settings=_split_extra(extra, "in"))
+        sd.check_output_settings(device=output_device, channels=1,
+                                 samplerate=rate, dtype="float32",
+                                 extra_settings=_split_extra(extra, "out"))
+        return True
+    except Exception:
+        return False
+
+
+def _split_extra(extra, side: str):
+    if extra is None:
+        return None
+    if isinstance(extra, tuple):
+        return extra[0] if side == "in" else extra[1]
+    return None
+
+
+def _probe_stream_rate(sd, rate: int, input_device, output_device,
+                       input_channels: int) -> Tuple[int, object]:
+    """选出「输入+输出都能打开」的采样率与 WASAPI 设置.
+
+    WASAPI 共享模式只接受设备原生采样率：默认输出若是 44.1k 虚拟声卡，
+    请求 48000 会报 `AUDCLNT_E_UNSUPPORTED_FORMAT`。这里用 PortAudio 的
+    能力查询（不打开流、不出声）逐个验证：先试用户请求的采样率（含 WASAPI
+    auto_convert 兜底），不行再退到设备原生采样率。
+    """
+    candidates = [int(rate)]
+    for dev in (output_device, input_device):
+        r = _native_rate(sd, dev, rate)
+        if r and r not in candidates:
+            candidates.append(int(r))
+    for r in (48000, 44100, 16000, 32000):
+        if r not in candidates:
+            candidates.append(r)
+
+    for cand in candidates:
+        combos = [None]
+        wasapi = _wasapi_settings(sd, input_device, output_device, cand)
+        if wasapi is not None:
+            combos.append(wasapi)
+        for extra in combos:
+            if _check_stream_format(sd, cand, input_device, output_device, input_channels, extra):
+                return int(cand), extra
+    # 全都查不出结果就按用户选的来，交给打开时的错误提示
+    return int(rate), _wasapi_settings(sd, input_device, output_device, rate)
+
+
+def _stream_error_hint(exc: Exception, rate: int, input_device, output_device) -> str:
+    msg = str(exc)
+    if "AUDCLNT_E_UNSUPPORTED_FORMAT" in msg or "Unsupported" in msg.title() or "-9997" in msg:
+        return (f"设备不支持 {rate}Hz 采集/播放（WASAPI 共享模式要求设备原生采样率）。"
+                f"请在界面把采样率改成设备默认值后重试；或改用 MME/DirectSound 设备。"
+                f"原始错误: {msg}")
+    return f"打开音频设备失败: {msg}"
+
+
 def run_device(
     job: Job,
     aec: AecSettings,
@@ -457,6 +768,8 @@ def run_device(
     duration_s: float = 6.0,
     play_gain: float = 1.0,
     input_channels: int = 1,
+    input_device_key: Optional[str] = None,
+    output_device_key: Optional[str] = None,
 ) -> None:
     try:
         import sounddevice as sd
@@ -464,9 +777,33 @@ def run_device(
         raise RuntimeError(f"sounddevice 不可用: {exc}") from exc
 
     out_dir = run_dir(job)
-    rate = int(device_rate)
     if not play:
         raise RuntimeError("设备模式需要显式允许播放参考音（本次测试已关闭播放）")
+
+    # 页面打开后若插拔过设备，数字索引可能已经指向别处，先用稳定标识重新定位
+    rin = _resolve_device(sd, input_device, input_device_key, "in")
+    rout = _resolve_device(sd, output_device, output_device_key, "out")
+    if input_device is not None and rin is None:
+        raise RuntimeError(f"找不到所选输入设备（索引 {input_device}"
+                           + (f"，{input_device_key}" if input_device_key else "") +
+                           "）。设备可能已被拔出，请点「刷新设备列表」重新选择。")
+    if output_device is not None and rout is None:
+        raise RuntimeError(f"找不到所选输出设备（索引 {output_device}"
+                           + (f"，{output_device_key}" if output_device_key else "") +
+                           "）。设备可能已被拔出，请点「刷新设备列表」重新选择。")
+    input_device, output_device = rin, rout
+    if input_device_key or output_device_key:
+        job.log(f"设备定位：输入 {_dev_label(sd, input_device) or '默认'}，"
+                f"输出 {_dev_label(sd, output_device) or '默认'}")
+
+    # 先确认这对设备能打开哪个采样率（只查能力，不打开流），再据此准备参考音，
+    # 否则会把整段信号按错误的采样率生成。
+    job.stage = "检查设备采样率"
+    req_rate = int(device_rate)
+    rate, stream_extra = _probe_stream_rate(
+        sd, req_rate, input_device, output_device, input_channels)
+    if rate != req_rate:
+        job.log(f"所选设备不支持 {req_rate}Hz，改用 {rate}Hz（设备的可用采样率）")
 
     job.stage = "准备参考音"
     job.progress = 0.03
@@ -524,18 +861,66 @@ def run_device(
 
     job.stage = "打开音频设备"
     blocksize = step
-    job.log(f"输入设备={input_device or '默认'}, 输出设备={output_device or '默认'}, "
-            f"块大小={blocksize} ({blocksize/rate*1000:.1f}ms)")
-    with sd.Stream(
-        samplerate=rate,
-        blocksize=blocksize,
-        dtype="float32",
-        channels=(max(1, int(input_channels)), 1),
-        device=(input_device, output_device),
-        callback=callback,
-    ):
-        job.stage = "播放参考音并采集"
-        job.log("已开始：请在参考音播放期间说几句话（双讲），结束后检查 AEC 输出")
+    extra = stream_extra
+    in_name = _dev_label(sd, input_device) or "默认"
+    out_name = _dev_label(sd, output_device) or "默认"
+    job.log(f"输入设备={in_name}, 输出设备={out_name}, "
+            f"块大小={blocksize} ({blocksize/rate*1000:.1f}ms)"
+            + ("，WASAPI 自动重采样已开启" if extra else ""))
+
+    # PortAudio 对 WDM-KS 后端经常在 start() 时才失败（WdmSyncIoctl / GLE 0x490），
+    # 而且这些错误在构造 Stream 时不会出现，所以必须把「构造 + start」整体纳入重试。
+    tried = []
+    stream = None
+    last_exc: Optional[Exception] = None
+    for cand_in, cand_out, cand_rate, cand_extra, why in _stream_attempts(
+            sd, input_device, output_device, rate, extra):
+        tag = (cand_in, cand_out, cand_rate)
+        if tag in tried:
+            continue
+        tried.append(tag)
+        try:
+            cand_stream = sd.Stream(
+                samplerate=cand_rate,
+                blocksize=frame_samples(cand_rate),
+                dtype="float32",
+                channels=(max(1, int(input_channels)), 1),
+                device=(cand_in, cand_out),
+                callback=callback,
+                extra_settings=cand_extra,
+            )
+            cand_stream.start()
+        except Exception as exc:
+            last_exc = exc
+            if any(cand_in == t[0] and cand_out == t[1] and cand_rate == t[2] for t in tried[:-1]):
+                continue
+            job.log(f"打开失败，换备选方案：{'；'.join(why) or '同参数重试'}（{_short_err(exc)}）")
+            continue
+        stream = cand_stream
+        if why:
+            job.log(f"已切换到备选方案：{'；'.join(why)}")
+        if cand_rate != rate:
+            job.log(f"采样率由 {rate}Hz 改为 {cand_rate}Hz")
+            # 参考音是按旧采样率生成的，必须跟着换，否则播放速度和音高会变
+            ref_play = resample(ref_play, rate, cand_rate)
+            total = len(ref_play)
+            rate = cand_rate
+        if (cand_in, cand_out) != (input_device, output_device):
+            job.log(f"设备由 {input_device}/{output_device} 重新定位到 "
+                    f"{_dev_label(sd, cand_in)} / {_dev_label(sd, cand_out)}")
+        input_device, output_device = cand_in, cand_out
+        break
+
+    if stream is None:
+        hint = _stream_error_hint(last_exc, rate, input_device, output_device)
+        alt = _native_rate(sd, output_device if output_device is not None else input_device, rate)
+        if alt:
+            hint += f"（本设备的原生采样率可能是 {alt}Hz）"
+        raise RuntimeError(hint) from last_exc
+
+    job.stage = "播放参考音并采集"
+    job.log("已开始：请在参考音播放期间说几句话（双讲），结束后检查 AEC 输出")
+    try:
         t0 = time.time()
         stalled_since = t0
         last_done = 0
@@ -555,28 +940,46 @@ def run_device(
             if time.time() - t0 > total / rate + 30:
                 job.log("采集总耗时异常，提前停止")
                 break
+    finally:
+        # 流已经手动 start() 过，这里只负责停与关（不能再用 with，会二次 start）
+        try:
+            stream.stop()
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
 
     job.stage = "整理录音"
     mic = np.concatenate(rec_mic) if rec_mic else np.zeros(0, dtype=np.float32)
     ref = np.concatenate(played) if played else np.zeros(0, dtype=np.float32)
     n = min(len(mic), len(ref))
     if n < rate // 2:
-        raise RuntimeError("采集数据过短，请检查麦克风权限/设备")
+        raise RuntimeError(_no_audio_hint(sd, input_device, output_device, rate))
     mic, ref = mic[:n], ref[:n]
     job.progress = 0.65
 
     job.stage = "运行 AEC"
+    # 设备流可能是 44100Hz（WASAPI 虚拟声卡的原生率），APM 只接受 8/16/32/48k，
+    # 所以处理前重采样到最近的 APM 采样率，输出再转回设备采样率。
+    apm_rate = nearest_apm_rate(rate)
+    if apm_rate != rate:
+        job.log(f"设备采样率 {rate}Hz 非 APM 支持值，内部按 {apm_rate}Hz 处理")
+    mic_p = resample(mic, rate, apm_rate) if apm_rate != rate else mic
+    ref_p = resample(ref, rate, apm_rate) if apm_rate != rate else ref
     delay_ms = float(aec.delay_ms)
     if aec.delay_auto:
-        est = estimate_delay_ms(mic, ref, rate, aec.delay_search_max)
+        est = estimate_delay_ms(mic_p, ref_p, apm_rate, aec.delay_search_max)
         # 系统自身的输入输出缓冲会贡献基础延迟，太小则取估计
         delay_ms = max(est, float(aec.delay_ms))
         job.log(f"自动延迟估计: {est:.0f} ms → 使用 {delay_ms:.0f} ms")
-    settings = AecSettings(**{**aec.to_dict(), "rate": rate, "delay_ms": int(round(delay_ms))})
-    with AecCore(settings, input_rate=rate) as core:
-        out = core.process_arrays(mic, ref, input_rate=rate)
+    settings = AecSettings(**{**aec.to_dict(), "rate": apm_rate, "delay_ms": int(round(delay_ms))})
+    with AecCore(settings, input_rate=apm_rate) as core:
+        out_p = core.process_arrays(mic_p, ref_p, input_rate=apm_rate)
         stats = _stats_dict(core)
         _log_warnings(job, stats)
+    out = resample(out_p, apm_rate, rate) if apm_rate != rate else out_p
     job.progress = 0.85
 
     out = out[:n]
